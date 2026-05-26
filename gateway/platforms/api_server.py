@@ -696,6 +696,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Active clarify session keys for each run_id.  The `clarify_gateway`
+        # primitive (tools/clarify_gateway.py) is session-keyed; we re-use
+        # the run_id as the session key so cleanup on run completion is a
+        # single ``clear_session(run_id)`` call.  Kept as a set to make
+        # the contract explicit: a single run can have multiple clarify
+        # entries pending in parallel (the agent can fire clarify from
+        # within a tool while another clarify is already mid-flight).
+        self._run_clarify_session_keys: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -940,6 +948,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        clarify_callback=None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -988,6 +997,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            clarify_callback=clarify_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -1084,8 +1094,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "run_clarify_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "clarify_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1100,6 +1112,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_clarify": {"method": "POST", "path": "/v1/runs/{run_id}/clarify"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
@@ -2903,6 +2916,76 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    def _make_clarify_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Build a clarify_callback that emits ``clarify.request`` SSE events
+        and blocks the agent thread until the API client resolves the
+        request via ``POST /v1/runs/{run_id}/clarify``.
+
+        The callback runs on the agent's worker thread (see clarify_tool's
+        synchronous contract).  It re-uses the existing module-level
+        primitive in ``tools.clarify_gateway`` for the blocking semantics
+        (threading.Event, timeout, session cleanup) — same machinery the
+        TUI / messaging gateway uses, just with a different delivery path
+        (SSE event instead of an adapter ``send_clarify`` call).
+
+        The clarify "session" is the ``run_id`` itself: each /v1/runs
+        invocation owns its own clarify scope, and ``clear_session(run_id)``
+        in the run-finally block unblocks any leftover waiters when the
+        run completes, fails, or is cancelled.
+        """
+        from tools import clarify_gateway as _clarify_mod
+        import uuid as _uuid
+
+        # One session per run.  Stored on the server so the /clarify
+        # POST handler and the finally-block cleanup can address it
+        # without needing to walk through the agent itself.
+        session_key = f"run:{run_id}"
+        self._run_clarify_session_keys[run_id] = session_key
+
+        def _callback(question: str, choices) -> str:
+            clarify_id = _uuid.uuid4().hex[:10]
+            _clarify_mod.register(
+                clarify_id=clarify_id,
+                session_key=session_key,
+                question=question,
+                choices=list(choices) if choices else None,
+            )
+
+            # Deliver the clarify request to the client via SSE.  The
+            # agent's worker thread runs in an executor, so we hop back
+            # to the gateway event loop with ``call_soon_threadsafe`` to
+            # touch the queue safely.
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, {
+                        "event": "clarify.request",
+                        "run_id": run_id,
+                        "clarify_id": clarify_id,
+                        "timestamp": time.time(),
+                        "question": question,
+                        "choices": list(choices) if choices else None,
+                    })
+                except Exception:
+                    logger.exception(
+                        "[api_server] failed to push clarify.request for run %s",
+                        run_id,
+                    )
+
+            # Block until the client POSTs an answer or the timeout fires.
+            timeout = _clarify_mod.get_clarify_timeout()
+            response = _clarify_mod.wait_for_response(
+                clarify_id, timeout=float(timeout),
+            )
+            if response is None or response == "":
+                # Either the timeout fired or the run is being torn down.
+                # Return a sentinel string so the agent can adapt instead
+                # of hanging — same contract as the messaging gateway.
+                return f"[user did not respond within {int(timeout / 60)}m]"
+            return response
+
+        return _callback
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -3039,6 +3122,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
+        clarify_cb = self._make_clarify_callback(run_id, loop)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -3070,6 +3154,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    clarify_callback=clarify_cb,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
@@ -3218,6 +3303,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
+                # Same story for clarify: if the agent thread is blocked on
+                # a clarify wait_for_response Event and the run is being
+                # torn down, ``clear_session`` resolves every outstanding
+                # entry with an empty sentinel so the agent unwinds quickly
+                # instead of pinning the executor for the full 10-minute
+                # default timeout.  Idempotent on normal completion.
+                try:
+                    from tools import clarify_gateway as _clarify_mod
+
+                    clarify_session_key = self._run_clarify_session_keys.get(run_id)
+                    if clarify_session_key:
+                        _clarify_mod.clear_session(clarify_session_key)
+                except Exception:
+                    pass
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -3226,6 +3325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_clarify_session_keys.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -3398,6 +3498,91 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_run_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/clarify — resolve a pending clarify request.
+
+        Body shape::
+
+            { "clarify_id": "<id from clarify.request event>",
+              "answer": "<user's response>" }
+
+        Returns ``409 clarify_not_pending`` if the clarify was already
+        resolved or expired, ``404 run_not_found`` if the run itself is
+        unknown, and ``200 OK`` on a successful resolution.
+
+        Pairs with the ``clarify.request`` event emitted on the run's SSE
+        stream — see ``_make_clarify_callback``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        clarify_id = body.get("clarify_id")
+        answer = body.get("answer")
+
+        if not clarify_id or not isinstance(clarify_id, str):
+            return web.json_response(
+                _openai_error(
+                    "Missing or invalid 'clarify_id'",
+                    code="missing_clarify_id",
+                ),
+                status=400,
+            )
+        if answer is None:
+            return web.json_response(
+                _openai_error(
+                    "Missing 'answer'",
+                    code="missing_answer",
+                ),
+                status=400,
+            )
+
+        from tools import clarify_gateway as _clarify_mod
+
+        resolved = _clarify_mod.resolve_gateway_clarify(clarify_id, str(answer))
+        if not resolved:
+            return web.json_response(
+                _openai_error(
+                    f"Clarify not pending or already resolved: {clarify_id}",
+                    code="clarify_not_pending",
+                ),
+                status=409,
+            )
+
+        # Push a small acknowledgement event so the client can dismiss its
+        # pending-clarify UI immediately, without waiting to observe the
+        # next agent tool call.  Best-effort; failure is non-fatal.
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "clarify.responded",
+                    "run_id": run_id,
+                    "clarify_id": clarify_id,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.run.clarify_response",
+            "run_id": run_id,
+            "clarify_id": clarify_id,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -3510,6 +3695,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/clarify", self._handle_run_clarify)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
