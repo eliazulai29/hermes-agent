@@ -13972,7 +13972,26 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        rc = args.func(args)
+        # B6.4 (2026-05-27 incident): a handler can signal failure by
+        # returning a non-zero int (e.g. cmd_kanban returns 1 when the
+        # kanban DB is corrupt — see hermes_cli/kanban.py line ~910).
+        # Before this change main() discarded args.func's return value
+        # entirely and the process always exited 0, even on hard
+        # failures.  The downstream desktop fork saw "exit 0 + empty
+        # stdout", interpreted that as success-but-no-output, ran
+        # JSON.parse("") on it and printed a misleading
+        # "Failed to parse JSON: Unexpected end of JSON input" warning
+        # every dispatcher tick for hours — completely burying the
+        # real "Refusing to open corrupt kanban DB" stderr.
+        #
+        # ``or 0`` keeps the historical "None means success" contract
+        # so handlers that don't bother returning anything still exit
+        # cleanly.  Only the explicit non-zero return triggers
+        # ``sys.exit`` — which is exactly the contract every caller
+        # already assumed.
+        if rc is not None and int(rc) != 0:
+            sys.exit(int(rc))
     else:
         parser.print_help()
 

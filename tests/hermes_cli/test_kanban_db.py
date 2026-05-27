@@ -3236,6 +3236,150 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Idempotent corrupt-DB backups (B6.4 — 2026-05-27 incident)
+# ---------------------------------------------------------------------------
+#
+# A single user-facing failure produced **198 byte-identical
+# ``.corrupt.*.bak`` files (178 MB)** in 12 minutes because the desktop's
+# kanban-tick dispatcher fires every 30 s, and every invocation of
+# ``hermes kanban dispatch`` against the corrupt DB ran the guard
+# unconditionally — making a fresh timestamped backup every time even
+# though the underlying corrupt file's bytes and mtime had not changed.
+#
+# The fix in ``_backup_corrupt_db`` short-circuits when an existing
+# ``<name>.corrupt.*.bak`` already matches the live file's
+# ``(st_size, st_mtime_ns)`` signature. That's safe because no code path
+# writes to a corrupt DB — we always raise ``KanbanDbCorruptError``
+# before the file would be opened for writes.
+
+
+def test_corrupt_db_backup_is_idempotent_across_invocations(tmp_path):
+    """Repeated guard invocations on the same corrupt DB must produce
+    EXACTLY ONE backup — not one per call.
+
+    Without idempotency, the desktop's 30 s dispatcher tick fills the
+    user's ``~/.hermes`` with hundreds of byte-identical backups
+    (observed: 198 files / 178 MB in 12 minutes). With the fix, the
+    backup directory's cardinality is bounded by the number of
+    distinct corrupt-file signatures (size, mtime) ever observed —
+    which on a stable filesystem is exactly 1.
+    """
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    # Call the guard 5 times — simulating ~2 minutes of dispatcher
+    # ticks at 30 s intervals. Each call should raise, but only the
+    # first should create a backup; the rest must reuse it.
+    backup_paths = []
+    for _ in range(5):
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.init_db(db_path=db_path)
+        backup_paths.append(excinfo.value.backup_path)
+
+    # All five raises must reference the SAME backup path (no new
+    # files created on calls 2–5).
+    assert all(p == backup_paths[0] for p in backup_paths), (
+        f"backup_path is not stable across calls: {backup_paths!r}"
+    )
+    # And the filesystem agrees: exactly one .corrupt.*.bak exists.
+    on_disk = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(on_disk) == 1, (
+        f"expected exactly 1 corrupt backup, got {len(on_disk)}: {on_disk!r}"
+    )
+
+
+def test_corrupt_db_backup_creates_new_when_signature_changes(tmp_path):
+    """If a user manually replaces the corrupt DB with a different
+    (still corrupt) file — different bytes → different mtime — a NEW
+    backup must be made. The idempotency optimisation must not mask
+    a genuinely distinct corruption event.
+    """
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.init_db(db_path=db_path)
+    first_backups = sorted(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(first_backups) == 1
+
+    # User overwrites the DB with a different corrupt payload. Use
+    # a 1-second sleep alternative: bump mtime explicitly to a value
+    # safely past the existing one.
+    import os
+    import time as _time
+
+    different_header = b"SQLite format 3\x00" + b"\x10\x00\x02\x02\x00\x40\x20\x20"
+    different_header += b"\x00\x00\x00\x0c\x00\x00\x23\x46\x00\x00\x00\x00"
+    different_header = different_header.ljust(100, b"\x00")
+    different_payload = b"a different kind of garbage \xff\xfe\xfd\xfc" * 64
+    db_path.write_bytes(different_header + different_payload)
+    new_ts = _time.time() + 60.0
+    os.utime(db_path, (new_ts, new_ts))
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.init_db(db_path=db_path)
+    second_backups = sorted(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    # Now we should have 2: the first signature's backup AND the new one.
+    assert len(second_backups) == 2, (
+        f"expected 2 backups after content change, got: {second_backups!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI exit code propagation (B6.4 — 2026-05-27 incident, hermes_cli/main.py)
+# ---------------------------------------------------------------------------
+#
+# ``main()`` was discarding ``args.func(args)``'s return value, so a
+# handler returning 1 (e.g. ``cmd_kanban`` on KanbanDbCorruptError) was
+# silently swallowed and the process exited 0. The desktop saw "exit 0
+# + empty stdout", ran ``JSON.parse("")`` and reported a meaningless
+# "Unexpected end of JSON input" warning every dispatcher tick instead
+# of surfacing the real stderr.
+
+
+def test_main_propagates_nonzero_return_code_from_command_handlers(monkeypatch, capsys):
+    """``main()`` must exit with the integer a command handler returns.
+
+    Before B6.4, this test would FAIL — ``args.func(args)`` was called
+    for its side-effects only and its return value discarded, so the
+    process always exited 0.
+    """
+    from hermes_cli import main as cli_main
+
+    # Build the minimal argv that gets us past arg-parsing into the
+    # func-dispatch tail of ``main()`` without touching the gateway,
+    # plugins, or any setup.  ``kanban`` parses cleanly and routes to
+    # ``cmd_kanban``; we don't need ``init_db`` to actually run because
+    # we patch the handler.
+    monkeypatch.setattr("sys.argv", ["hermes", "kanban", "ls"])
+
+    # Replace cmd_kanban with a stub that returns 7 so we can read
+    # the exit code without spawning a subprocess.
+    monkeypatch.setattr(cli_main, "cmd_kanban", lambda args: 7)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_main.main()
+    # SystemExit code matches the handler return.
+    assert excinfo.value.code == 7
+
+
+def test_main_treats_none_return_as_success(monkeypatch):
+    """A handler returning ``None`` (or 0) must NOT raise SystemExit —
+    the historical "no news is good news" contract is preserved."""
+    from hermes_cli import main as cli_main
+
+    monkeypatch.setattr("sys.argv", ["hermes", "kanban", "ls"])
+    monkeypatch.setattr(cli_main, "cmd_kanban", lambda args: None)
+    # Should return cleanly without raising.
+    cli_main.main()
+
+    monkeypatch.setattr(cli_main, "cmd_kanban", lambda args: 0)
+    cli_main.main()
+
+
+# ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
 

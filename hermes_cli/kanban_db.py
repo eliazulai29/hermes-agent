@@ -1035,6 +1035,21 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     Writes are confined to the original DB's parent directory. The
     backup basename is derived purely from ``path.name``, never from
     caller-supplied directory segments — no traversal is possible.
+
+    Idempotency (B6.4 — 2026-05-27 incident): a corrupt DB doesn't
+    heal itself between invocations, and the desktop's kanban-tick
+    dispatcher fires every 30s, so a naive "always make a new backup"
+    loop produced **198 identical 912 KB ``.corrupt.*.bak`` files in
+    12 minutes** (178 MB of byte-identical clones) before the user
+    noticed.  If any existing ``<name>.corrupt.*.bak`` in the parent
+    dir already has the same ``(st_size, st_mtime_ns)`` as the live
+    corrupt file, skip the new copy and return the existing backup
+    path — the WAL/SHM sidecars are equally redundant when the main
+    file's signature already matches, so we skip those too.  This is
+    safe because no code path WRITES to a corrupt DB (we always raise
+    KanbanDbCorruptError before opening it for writes), so ``mtime``
+    cannot change between invocations without the user explicitly
+    repairing it.
     """
     # Resolve once and pin the parent so subsequent path operations cannot
     # escape it. ``Path.resolve()`` collapses any ``..`` segments and
@@ -1042,6 +1057,33 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+
+    # Idempotency probe: is there already a backup of this exact file
+    # signature?  ``(st_size, st_mtime_ns)`` uniquely identifies the
+    # content for our purposes — the corrupt file can't be written to,
+    # so its mtime is stable, and any backup we made was a byte copy.
+    try:
+        live_stat = resolved.stat()
+    except OSError:
+        return None
+    backup_glob = f"{base_name}.corrupt.*.bak"
+    try:
+        existing_backups = sorted(parent.glob(backup_glob), reverse=True)
+    except OSError:
+        existing_backups = []
+    for prior in existing_backups:
+        if prior.parent != parent:
+            continue
+        try:
+            prior_stat = prior.stat()
+        except OSError:
+            continue
+        if (
+            prior_stat.st_size == live_stat.st_size
+            and prior_stat.st_mtime_ns == live_stat.st_mtime_ns
+        ):
+            return prior
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
     # Defensive: candidate must still be inside parent after construction.
