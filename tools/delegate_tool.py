@@ -574,6 +574,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    inherited_doctrine: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -582,12 +583,45 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    When ``inherited_doctrine`` is provided (typically the parent's
+    profile SOUL.md), it is prepended as a top-level block so the
+    subagent operates under the same identity, language defaults,
+    confidentiality rules, vault protocol, skill awareness, and
+    grounding rules as the parent.  This is critical for product
+    deployments that handle sensitive data (insurance, healthcare,
+    legal) — without doctrine inheritance, workers default to a
+    generic English subagent persona and may echo credentials,
+    fabricate domain-specific data, or bypass product-specific
+    workflows the main agent follows.  Falls back to the legacy
+    bare-bones prompt when ``inherited_doctrine`` is None / empty,
+    preserving backward compatibility for callers that don't opt in.
     """
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
+    parts: List[str] = []
+
+    if inherited_doctrine and inherited_doctrine.strip():
+        parts.append(
+            "## INHERITED DOCTRINE (from parent agent's profile)\n\n"
+            f"{inherited_doctrine.strip()}\n\n"
+            "---\n"
+        )
+        parts.append(
+            "You are a focused SUBAGENT of the parent agent above. "
+            "The doctrine above applies fully to your work — same language "
+            "defaults, same grounding rules, same confidentiality, same "
+            "credential protocol, same skill awareness. You are scoped to "
+            "a single task and report back to the parent agent (not "
+            "directly to a human), so be structured and source-cited."
+        )
+    else:
+        parts.append(
+            "You are a focused subagent working on a specific delegated task."
+        )
+
+    parts.extend([
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -968,6 +1002,23 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+
+    # Inherit parent profile's SOUL.md so workers carry the same identity,
+    # language defaults, confidentiality rules, vault protocol, skill
+    # awareness, and grounding rules end-to-end.  Safety-critical for
+    # products handling PII (Shavit / insurance, healthcare apps, legal).
+    # Read it fresh each call — load_soul_md() is a small file read keyed
+    # off HERMES_HOME, and re-reading lets the user edit doctrine without
+    # restarting the gateway.  Failures are swallowed so a missing or
+    # unreadable SOUL never blocks delegation (we fall back to the legacy
+    # bare-bones subagent prompt).
+    inherited_doctrine: Optional[str] = None
+    try:
+        from agent.prompt_builder import load_soul_md
+        inherited_doctrine = load_soul_md()
+    except Exception:
+        inherited_doctrine = None
+
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -975,6 +1026,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        inherited_doctrine=inherited_doctrine,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
