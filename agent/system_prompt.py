@@ -166,15 +166,31 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
+    # The set of toolsets enabled this session (reused for both the capability
+    # map and the skills prompt).
+    avail_toolsets = {
+        toolset
+        for toolset in (
+            _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
+        )
+        if toolset
+    }
+
+    # Capability map (Step A): a generated best-path decision table so the agent
+    # routes a request to the right tool/skill instead of inferring from prose.
+    # Built from the enabled toolsets; disabled archetypes are shown with a hint.
+    if agent.valid_tool_names:
+        try:
+            from agent.prompt_builder import build_capability_map
+            capability_map = build_capability_map(avail_toolsets)
+            if capability_map:
+                stable_parts.append(capability_map)
+        except Exception:
+            # Never let capability-map generation break prompt assembly.
+            pass
+
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
-        avail_toolsets = {
-            toolset
-            for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
-            )
-            if toolset
-        }
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,

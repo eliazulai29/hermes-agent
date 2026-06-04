@@ -243,6 +243,111 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+# =========================================================================
+# Capability map (Step A: capability-aware best-path routing)
+# =========================================================================
+#
+# A machine-generated decision table the agent sees each turn, telling it —
+# for the most common insurance-agent task archetypes — which tool/skill is
+# the best path, with a fallback, built from the ACTUALLY-ENABLED toolsets
+# this session. When an archetype's primary toolset is DISABLED, we still list
+# it with a "(requires <toolset> — currently disabled)" hint so the agent is
+# aware of what it could do, not just what it has. This replaces vague prose in
+# SOUL.md with explicit routing the agent can follow reliably.
+#
+# Each archetype: (label, primary_toolset, primary_hint, fallback_hint).
+# primary_toolset is the toolset that must be enabled for the primary path.
+_CAPABILITY_ARCHETYPES = [
+    (
+        "Policy PDF / coverage / exclusion question",
+        "skills",
+        "skill_view('policy-explain') — Hebrew policy table, fast, domain-specific",
+        "vision (analyze the PDF pages) → web_search for any rate/clause to verify",
+    ),
+    (
+        "Log into a carrier portal (מגדל/הראל/כלל/הפניקס/…)",
+        "skills",
+        "skill_view('carrier-portal-access') — vault creds + browser, with the forbidden-actions rules",
+        "ask the user via clarify(new_domain:<carrier>) to store credentials first",
+    ),
+    (
+        "Any price / premium / rate / percentage / regulation",
+        "web",
+        "web_search — the ONLY sanctioned source; NEVER state these from memory (SOUL Rule 8)",
+        "say you couldn't verify and recommend the carrier's official site",
+    ),
+    (
+        "Any calculation (premium sums, commission, age-from-ID, days-to-expiry)",
+        "terminal",
+        "terminal with Python — exact arithmetic",
+        "(no fallback — browser_console is FORBIDDEN for math)",
+    ),
+    (
+        "Read / draft / search the user's email",
+        "skills",
+        "skill_view('google-workspace') then $GAPI gmail … (or himalaya for app-password Gmail)",
+        "web/browser only if no mail skill is configured",
+    ),
+    (
+        "Analyze a photo (damaged car, policy card, ID)",
+        "vision",
+        "vision — extract structured fields from the image",
+        "ask the user to re-send a clearer photo",
+    ),
+    (
+        "Remember / recall a customer fact",
+        "memory",
+        "memory_probe BEFORE asking; memory_store at end of turn if something material was learned",
+        "session_search across past conversations",
+    ),
+    (
+        "Heavy coding / multi-step research / large file processing",
+        "skills",
+        "skill_view('code-power-tools') → delegate to claude-code / codex",
+        "do it inline with terminal + web if the subagent CLI isn't installed",
+    ),
+    (
+        "N parallel long-running items (run a batch, monitor several)",
+        "kanban",
+        "kanban — one durable task per item, auto-dispatched",
+        "delegation for a SINGLE background subtask (kanban for one item is over-engineering)",
+    ),
+]
+
+
+def build_capability_map(available_toolsets: set[str]) -> str:
+    """Generate the per-turn capability decision table from the ENABLED toolsets.
+
+    ``available_toolsets`` is the set of toolsets active this session (derived
+    from ``agent.valid_tool_names`` via ``get_toolset_for_tool``). For each task
+    archetype we emit the best-path line; if its primary toolset is disabled we
+    still show it with a hint so the agent knows the capability exists but is off.
+    Returns an empty string if nothing useful can be said.
+    """
+    lines = []
+    for label, toolset, primary, fallback in _CAPABILITY_ARCHETYPES:
+        if toolset in available_toolsets:
+            lines.append(f"- {label} → {primary}. Fallback: {fallback}.")
+        else:
+            lines.append(
+                f"- {label} → requires the `{toolset}` toolset "
+                f"(currently DISABLED — tell the user it can be enabled in settings). "
+                f"Best path when enabled: {primary}."
+            )
+    if not lines:
+        return ""
+    return (
+        "# Capability map — your best path for common tasks (this turn)\n"
+        "When the user asks for an operation, route to the path below before "
+        "improvising. Only paths whose toolset is enabled are usable now; "
+        "disabled ones tell you a capability EXISTS but must be turned on.\n"
+        + "\n".join(lines)
+        + "\nThere is no 1:1 request→tool mapping — pick the path that best "
+        "serves the user's TRUE intent, and prefer a domain skill over a raw "
+        "tool when one matches."
+    )
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
