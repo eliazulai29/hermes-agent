@@ -297,7 +297,7 @@ _CAPABILITY_ARCHETYPES = [
     (
         "Remember / recall a customer fact",
         "memory",
-        "memory_probe BEFORE asking; memory_store at end of turn if something material was learned",
+        "memory(action=read) BEFORE asking; memory(action=add) at end of turn if something material was learned",
         "session_search across past conversations",
     ),
     (
@@ -311,6 +311,12 @@ _CAPABILITY_ARCHETYPES = [
         "kanban",
         "kanban — one durable task per item, auto-dispatched",
         "delegation for a SINGLE background subtask (kanban for one item is over-engineering)",
+    ),
+    (
+        "Recurring or future-dated work (renewal reminders, weekly summary, 'every day at 08:00')",
+        "cronjob",
+        "cronjob(action='create', …) — a durable scheduled job that fires on its own",
+        "a single kanban task if it's a one-off, not recurring",
     ),
 ]
 
