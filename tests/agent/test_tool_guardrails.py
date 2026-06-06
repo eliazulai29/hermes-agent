@@ -256,3 +256,53 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_browser_dead_end_loop_blocks_across_different_urls():
+    """The real 2026-06-06 bug: an agent navigating to DIFFERENT wrong URLs that
+    each return a tiny empty result must be caught as no-progress and halted —
+    not grind to max_iterations. Browser tools are mutating, and the URLs differ
+    each call, so the old guard (idempotent-only, keyed by tool+args) missed it.
+    """
+    from agent.tool_guardrails import (
+        ToolCallGuardrailController,
+        ToolCallGuardrailConfig,
+    )
+
+    cfg = ToolCallGuardrailConfig(hard_stop_enabled=True)
+    ctrl = ToolCallGuardrailController(cfg)
+    ctrl.reset_for_turn()
+
+    blocked_at = None
+    for i in range(12):
+        url = f"https://migdal.co.il/wrong-path-{i}"  # different URL each time
+        before = ctrl.before_call("browser_navigate", {"url": url})
+        if before.action == "block":
+            blocked_at = i
+            break
+        ctrl.after_call("browser_navigate", {"url": url}, "empty")  # tiny result
+
+    assert blocked_at is not None, "dead-end browser loop was never blocked"
+    assert blocked_at <= cfg.no_progress_block_after + 1
+    assert ctrl.halt_decision is not None
+    assert ctrl.halt_decision.code == "idempotent_no_progress_block"
+
+
+def test_browser_with_real_content_is_not_falsely_blocked():
+    """Genuine progress (large, varying snapshots) must NOT be blocked — the
+    guard only trips on tiny/no-progress results."""
+    from agent.tool_guardrails import (
+        ToolCallGuardrailController,
+        ToolCallGuardrailConfig,
+    )
+
+    cfg = ToolCallGuardrailConfig(hard_stop_enabled=True)
+    ctrl = ToolCallGuardrailController(cfg)
+    ctrl.reset_for_turn()
+
+    for i in range(10):
+        url = f"https://example.com/page-{i}"
+        before = ctrl.before_call("browser_navigate", {"url": url})
+        assert before.action != "block", f"falsely blocked real progress at {i}"
+        # A real page snapshot — thousands of chars, different each time.
+        ctrl.after_call("browser_navigate", {"url": url}, "x" * 3000 + str(i))

@@ -1047,12 +1047,22 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a durable kanban task that runs on its own background worker "
+        "and is VISIBLE to the user in the 'Kanban' board. TWO uses:\n"
+        "1) MAIN-AGENT BOARD (user-facing): when the user's request is N "
+        "independent items they'd benefit from watching progress on — e.g. "
+        "'compare 5 insurance carriers', 'update 12 client policies', "
+        "'research these 4 topics' — create ONE task per item, up front, "
+        "instead of doing them inline in this chat turn. Each runs in "
+        "parallel on its own worker, survives the chat closing, and the user "
+        "sees per-item progress in the board. Do this even though you are the "
+        "main agent — that is exactly when a board is the right call.\n"
+        "2) WORKER FAN-OUT: an orchestrator worker decomposes its own task "
+        "into children (pass the current task id in ``parents``), links them "
+        "into a pipeline, then completes its own task.\n"
+        "The dispatcher picks up new tasks on its next tick (~30s) and spawns "
+        "the assigned profile. Prefer this over doing N slow items inline; "
+        "prefer a single direct answer for ONE atomic item."
     ),
     "parameters": {
         "type": "object",
@@ -1064,10 +1074,13 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Profile name that should execute this task. Required — "
+                    "tasks without an assignee are never dispatched. For a "
+                    "MAIN-AGENT user-facing board, use the active profile "
+                    "(usually 'general') for every card unless a specialized "
+                    "orchestrator profile exists. For WORKER fan-out, use the "
+                    "specialized profile names your orchestrator defines "
+                    "(e.g. 'researcher-a', 'reviewer', 'writer')."
                 ),
             },
             "body": {

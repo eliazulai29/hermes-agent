@@ -59,6 +59,28 @@ MUTATING_TOOL_NAMES = frozenset(
     }
 )
 
+# Tools that mutate state (so they're not "idempotent") but whose REPEATED
+# near-identical results still mean "no progress" and should trip the
+# no-progress guard. A browser clicking/navigating through dead-end pages on a
+# site with no public data returns tiny, near-identical snapshots over and over
+# without erroring — neither the failure guard nor the idempotent no-progress
+# guard catches it, so the agent grinds to max_iterations. Tracking these for
+# no-progress closes that blind spot. (real bug, 2026-06-06)
+NO_PROGRESS_TRACKED_TOOL_NAMES = frozenset(
+    {
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "browser_press",
+        "browser_scroll",
+    }
+)
+
+# A browser result at or below this many (stripped) chars is treated as empty /
+# no-progress. Observed dead-end clicks returned ~36-37 chars; real page
+# snapshots are thousands of chars, so this cleanly separates the two.
+NO_PROGRESS_TINY_RESULT_CHARS = 120
+
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
@@ -79,6 +101,9 @@ class ToolCallGuardrailConfig:
     no_progress_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
+    no_progress_tracked_tools: frozenset[str] = field(
+        default_factory=lambda: NO_PROGRESS_TRACKED_TOOL_NAMES
+    )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
@@ -231,7 +256,7 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
-        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._no_progress: dict[object, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -261,7 +286,9 @@ class ToolCallGuardrailController:
             return decision
 
         if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
+            record = self._no_progress.get(
+                self._no_progress_key(tool_name, signature)
+            )
             if record is not None:
                 _result_hash, repeat_count = record
                 if repeat_count >= self.config.no_progress_block_after:
@@ -269,9 +296,11 @@ class ToolCallGuardrailController:
                         action="block",
                         code="idempotent_no_progress_block",
                         message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
+                            f"Blocked {tool_name}: it returned the same (or empty) "
+                            f"result {repeat_count} times with no new information. "
+                            "Stop repeating this approach — the data likely isn't "
+                            "available this way (e.g. the site needs login). Try a "
+                            "different method or tell the user what's blocking you."
                         ),
                         tool_name=tool_name,
                         count=repeat_count,
@@ -351,12 +380,22 @@ class ToolCallGuardrailController:
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
-        result_hash = _result_hash(result)
-        previous = self._no_progress.get(signature)
+        np_key = self._no_progress_key(tool_name, signature)
+        # For browser-style tracked tools, treat a TINY result as "no progress"
+        # regardless of exact bytes: a dead-end click/navigate returns an empty
+        # or near-empty snapshot (the real loop returned ~36-char results). Bucket
+        # all tiny results under one hash so they accumulate even when the wrong
+        # URL changes each call. Other tools use the exact result hash as before.
+        is_tracked = tool_name in self.config.no_progress_tracked_tools
+        if is_tracked and len((result or "").strip()) <= NO_PROGRESS_TINY_RESULT_CHARS:
+            result_hash = "__tiny__"
+        else:
+            result_hash = _result_hash(result)
+        previous = self._no_progress.get(np_key)
         repeat_count = 1
         if previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
-        self._no_progress[signature] = (result_hash, repeat_count)
+        self._no_progress[np_key] = (result_hash, repeat_count)
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(
@@ -375,9 +414,27 @@ class ToolCallGuardrailController:
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
     def _is_idempotent(self, tool_name: str) -> bool:
+        # Used to gate no-progress tracking. Mutating tools are normally
+        # excluded — except those explicitly tracked for no-progress (browser
+        # navigation/clicking), where repeated near-identical results signal a
+        # dead-end loop even though the tool technically mutates page state.
+        if tool_name in self.config.no_progress_tracked_tools:
+            return True
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
+
+    def _no_progress_key(
+        self, tool_name: str, signature: "ToolCallSignature"
+    ) -> object:
+        # For browser-style tracked tools, key no-progress by TOOL NAME alone,
+        # not by (tool, args). A dead-end loop navigates to DIFFERENT wrong URLs
+        # each time — keying by args would reset the counter every call and miss
+        # the loop. Keying by tool name catches "this browser tool keeps
+        # returning the same tiny/empty result regardless of which URL."
+        if tool_name in self.config.no_progress_tracked_tools:
+            return ("__tool__", tool_name)
+        return signature
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:

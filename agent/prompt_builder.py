@@ -307,10 +307,13 @@ _CAPABILITY_ARCHETYPES = [
         "do it inline with terminal + web if the subagent CLI isn't installed",
     ),
     (
-        "N parallel long-running items (run a batch, monitor several)",
+        "N independent items the user benefits from watching (compare 5 carriers, "
+        "update 12 policies, research 4 topics) — even when the user just said it in words",
         "kanban",
-        "kanban — one durable task per item, auto-dispatched",
-        "delegation for a SINGLE background subtask (kanban for one item is over-engineering)",
+        "kanban_create ONE card per item, up front (assignee='general') — they run in "
+        "parallel on background workers, survive the chat closing, and the user sees per-item "
+        "progress in the board. Do NOT do N slow items inline in one chat turn",
+        "delegate_task for a SINGLE background subtask; a direct answer for ONE atomic item",
     ),
     (
         "Recurring or future-dated work (renewal reminders, weekly summary, 'every day at 08:00')",
