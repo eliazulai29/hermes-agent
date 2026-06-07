@@ -846,6 +846,31 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
 
+        # Non-success status / exit_reason (subagents, code-exec, etc.). A
+        # delegate or tool that TIMED OUT or hit max_iterations returns a
+        # status like "timeout"/"incomplete"/"max_iterations_reached" but may
+        # carry NO "error" key — so the checks above miss it and the model
+        # reads a PARTIAL result as if it were complete. Treat any non-success
+        # terminal status as a failure so the result is visibly flagged.
+        _NON_SUCCESS_STATUSES = {
+            "timeout",
+            "timed_out",
+            "incomplete",
+            "partial",
+            "error",
+            "failed",
+            "failure",
+            "max_iterations_reached",
+            "max_turns_reached",
+            "cancelled",
+            "canceled",
+            "aborted",
+        }
+        for _key in ("status", "exit_reason"):
+            _val = str(data.get(_key) or "").strip().lower()
+            if _val and _val in _NON_SUCCESS_STATUSES:
+                return True, f" [{_val}]"
+
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.

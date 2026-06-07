@@ -183,3 +183,44 @@ class TestGetCuteToolMessageFailureSuffix:
         # failure suffix.
         line = get_cute_tool_message("terminal", {"command": "ls"}, 0.2)
         assert "[" not in line.split("0.2s", 1)[1]
+
+
+# Non-success status / exit_reason without an explicit error key — a subagent
+# that timed out or hit max_iterations returns partial work with status set but
+# no "error", which used to read as success and let the model report incomplete
+# work as complete. (issue: silent partial results, 2026-06-07)
+import json as _json
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "timeout", "exit_reason": "timeout", "partial_output": "2 of 5"},
+        {"status": "incomplete", "result": "partial: 3 of 10"},
+        {"status": "max_iterations_reached", "result": "did what I could"},
+        {"status": "cancelled"},
+        {"exit_reason": "timeout"},
+    ],
+)
+def test_non_success_status_is_flagged(payload):
+    from agent.display import _detect_tool_failure
+
+    is_fail, suffix = _detect_tool_failure("delegate_task", _json.dumps(payload))
+    assert is_fail, f"{payload} should be flagged as a failure"
+    assert suffix.strip()
+
+
+@_pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "success", "result": "all done"},
+        {"status": "completed", "result": "done"},
+        {"result": "normal output, no status"},
+    ],
+)
+def test_success_status_is_not_falsely_flagged(payload):
+    from agent.display import _detect_tool_failure
+
+    is_fail, _ = _detect_tool_failure("delegate_task", _json.dumps(payload))
+    assert not is_fail, f"{payload} must NOT be flagged"
