@@ -295,6 +295,26 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the current entries for a target store ('memory' or 'user').
+
+        PURE read — never mutates, locks, or triggers drift-backup. Reads the
+        file fresh off disk so cross-session writes are reflected, falling back
+        to the in-memory entries if the file can't be read. SOUL.md and the
+        capability map instruct the agent to call ``memory(action=read)``
+        before discussing a customer; this is that read path.
+        """
+        try:
+            entries = self._read_file(self._path_for(target))
+        except Exception:
+            entries = list(self._entries_for(target))
+        return {
+            "success": True,
+            "target": target,
+            "count": len(entries),
+            "entries": entries,
+        }
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -618,7 +638,10 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
-    if action == "add":
+    if action == "read":
+        result = store.read(target)
+
+    elif action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
         result = store.add(target, content)
@@ -636,7 +659,10 @@ def memory_tool(
         result = store.remove(target, old_text)
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(
+            f"Unknown action '{action}'. Use: read, add, replace, remove",
+            success=False,
+        )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -671,7 +697,9 @@ MEMORY_SCHEMA = {
         "TWO TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
-        "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
+        "ACTIONS: read (return current entries -- call this BEFORE discussing a "
+        "customer so you ground on what you already know), add (new entry), "
+        "replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
@@ -680,8 +708,8 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform."
+                "enum": ["read", "add", "replace", "remove"],
+                "description": "The action to perform. 'read' returns current entries (call before discussing a customer)."
             },
             "target": {
                 "type": "string",

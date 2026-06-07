@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
 
+# A recurring job that fails this many times IN A ROW is auto-paused and
+# flagged for the user (and optional self-investigation), instead of failing
+# silently forever. 3 catches a real, persistent break (a changed portal, a
+# bad selector) quickly without over-reacting to a one-off transient hiccup.
+CRON_FAILURE_PAUSE_THRESHOLD = int(
+    os.getenv("HERMES_CRON_FAILURE_PAUSE_THRESHOLD", "3")
+)
+
 try:
     from croniter import croniter
     HAS_CRONITER = True
@@ -678,6 +686,9 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        # Consecutive-failure escalation (auto-pause + alert after N in a row).
+        "consecutive_failures": 0,
+        "needs_attention": False,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -909,6 +920,41 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+
+                # Consecutive-failure escalation. A recurring job that keeps
+                # failing identically (e.g. a carrier portal changed its login)
+                # would otherwise fail silently FOREVER — the worst case for a
+                # non-technical user who trusts the automation is running. Count
+                # consecutive failures; at the threshold, pause the job and flag
+                # it for escalation so the user is told and (optionally) Shavit
+                # can investigate. Reset to 0 on any success. (issue: cron silent
+                # infinite failure, 2026-06-07)
+                if success:
+                    job["consecutive_failures"] = 0
+                    job["needs_attention"] = False
+                else:
+                    job["consecutive_failures"] = (
+                        job.get("consecutive_failures", 0) + 1
+                    )
+                    if job["consecutive_failures"] >= CRON_FAILURE_PAUSE_THRESHOLD:
+                        job["enabled"] = False
+                        job["state"] = "paused"
+                        job["paused_at"] = now
+                        job["paused_reason"] = (
+                            f"נכשלה {job['consecutive_failures']} פעמים ברצף — "
+                            f"הושהתה אוטומטית. שגיאה אחרונה: {error or 'לא ידועה'}"
+                        )
+                        # Flag for the desktop proactivity tick to surface in chat
+                        # and (if enabled) for Shavit to investigate.
+                        job["needs_attention"] = True
+                        logger.warning(
+                            "Cron job '%s' (%s) paused after %d consecutive "
+                            "failures: %s",
+                            job.get("name", job["id"]),
+                            job["id"],
+                            job["consecutive_failures"],
+                            error,
+                        )
                 
                 # Increment completed count
                 if job.get("repeat"):
