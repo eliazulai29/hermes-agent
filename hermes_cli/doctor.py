@@ -1327,10 +1327,19 @@ def run_doctor(args):
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
-        # Check if agent-browser is installed
-        agent_browser_path = PROJECT_ROOT / "node_modules" / "agent-browser"
+        # Check if agent-browser is installed. The desktop installs it into the
+        # cli-tools prefix (HERMES_HOME/bin/node_modules), NOT the engine's
+        # PROJECT_ROOT/node_modules — so check BOTH, else it's a false negative
+        # on every desktop install (the binary IS there and works).
+        _hermes_home = Path(
+            os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
+        )
+        agent_browser_candidates = [
+            PROJECT_ROOT / "node_modules" / "agent-browser",
+            _hermes_home / "bin" / "node_modules" / "agent-browser",
+        ]
         agent_browser_ok = False
-        if agent_browser_path.exists():
+        if any(p.exists() for p in agent_browser_candidates):
             check_ok("agent-browser (Node.js)", "(browser automation)")
             agent_browser_ok = True
         elif shutil.which("agent-browser"):
