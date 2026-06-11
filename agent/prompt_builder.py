@@ -374,7 +374,12 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
+# NOTE: Claude (sonnet/opus/haiku) added 2026-06 — it exhibits the same
+# "narrate the action instead of calling the tool" drift in the credential
+# flow (says "I'll open the secure form" repeatedly but never calls clarify).
+# Enforcement guidance is family-agnostic and harmless for models that don't
+# need it, so injecting it for Claude too is the cheap, correct fix.
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek", "claude", "sonnet", "opus", "haiku")
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,

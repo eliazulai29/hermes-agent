@@ -1362,11 +1362,37 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     except Exception as e:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
-    try:
-        _ra().cleanup_browser(task_id)
-    except Exception as e:
+    # Browser persistence across turns.
+    #
+    # This hook runs at the END OF EVERY TURN. Closing the browser here means
+    # any turn that pauses for the user (an approval gate, a 2FA/OTP prompt)
+    # tears down the browser session — and the NEXT turn spawns a brand-new
+    # session with a fresh, empty cookie jar. The result: the user logs in,
+    # approves the next step, and the browser is already logged out (blank page
+    # / bounce back to the login screen). Multi-step + human-in-the-loop browser
+    # flows (carrier portals, CRM logins with 2FA) can never complete.
+    #
+    # When HERMES_BROWSER_PERSIST_TURNS is enabled (default ON — it is opt-out),
+    # we SKIP the per-turn browser close. The browser's own inactivity reaper
+    # (_browser_cleanup_thread_worker, BROWSER_SESSION_INACTIVITY_TIMEOUT, 300s)
+    # still frees idle sessions, and full-run/agent cleanup still closes it — so
+    # nothing leaks; the session merely survives between turns of the SAME task.
+    # Mirrors the VM persistence path above (is_persistent_env).
+    _persist_browser = os.environ.get(
+        "HERMES_BROWSER_PERSIST_TURNS", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if _persist_browser:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.debug(
+                f"Skipping per-turn cleanup_browser for task {task_id}; "
+                f"session persists across turns (idle reaper still applies)."
+            )
+    else:
+        try:
+            _ra().cleanup_browser(task_id)
+        except Exception as e:
+            if agent.verbose_logging:
+                logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
 
 
 

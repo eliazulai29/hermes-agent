@@ -356,6 +356,10 @@ def run_conversation(
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
     agent._post_tool_empty_retried = False
+    # Credential-form rescue: how many times this turn we've forced a
+    # continuation because the model narrated a `new_domain:` request as text
+    # instead of calling the clarify tool. Reset per user turn.
+    agent._clarify_rescue_count = 0
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
@@ -3914,7 +3918,86 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
-                
+
+                # ── Credential-form rescue ────────────────────────────────
+                # The carrier-portal / login flow requires the model to CALL
+                # the `clarify` tool with a `new_domain:<slug>,...` question so
+                # the desktop opens its secure masked credential form.  In
+                # practice Claude (and others) frequently *narrate* this — they
+                # write "I'll open the secure form" or even paste the literal
+                # `new_domain:smscrm, ...` string into their TEXT — and then end
+                # the turn WITHOUT making the tool call.  No tool call → no
+                # event → no form → the user is stuck on a login page.
+                # Prompt-level fixes proved insufficient, so we enforce it here:
+                # if a turn is about to end with text that contains the
+                # `new_domain:` marker but produced no clarify tool_call, inject
+                # one forceful continuation telling the model to actually call
+                # the tool now.  Bounded by a per-turn counter so a model that
+                # keeps refusing can't spin forever.
+                # Two trigger shapes, because the model rarely writes the
+                # literal `new_domain:` token — it almost always NARRATES the
+                # intent in prose instead ("אקפיץ טופס מאובטח" / "I'll open the
+                # secure form" / "אבקש את הפרטים בטופס מאובטח").  We catch both:
+                #   (a) the literal `new_domain:<slug>` marker, OR
+                #   (b) a credential-form narration phrase.
+                # Guarded so we only rescue when the model genuinely ended the
+                # turn with text (no tool call this turn) AND has not already
+                # been nudged twice.
+                _cred_narration = re.compile(
+                    r"new_domain:[A-Za-z0-9._-]+"          # literal marker
+                    r"|טופס\s*מאובטח"                       # "secure form" (he)
+                    r"|secure\s*form"                       # "secure form" (en)
+                    r"|פרטי\s*הגישה|פרטי\s*כניסה"           # "access/login details" (he)
+                    r"|הזנת\s*הפרטים",                      # "entering the details" (he)
+                    re.IGNORECASE,
+                )
+                _new_domain_in_text = bool(
+                    final_response and _cred_narration.search(final_response)
+                )
+                if _new_domain_in_text and getattr(
+                    agent, "_clarify_rescue_count", 0
+                ) < 2:
+                    agent._clarify_rescue_count = (
+                        getattr(agent, "_clarify_rescue_count", 0) + 1
+                    )
+                    logger.info(
+                        "%sCredential-form rescue: model wrote a new_domain: "
+                        "marker in TEXT without calling clarify — forcing a "
+                        "continuation to make the tool call (attempt %d/2).",
+                        agent.log_prefix,
+                        agent._clarify_rescue_count,
+                    )
+                    # Persist the narrated text as an interim assistant turn so
+                    # the transcript stays coherent, then nudge.
+                    _interim = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    messages.append(_interim)
+                    agent._emit_interim_assistant_message(_interim)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[System: STOP. You said you would open the "
+                                "secure credential form / ask for login details, "
+                                "but you ended your turn with TEXT and did NOT "
+                                "call any tool. Narrating opens nothing — the form "
+                                "only appears when you actually CALL the `clarify` "
+                                "tool. Do it NOW as your very next action: call "
+                                "`clarify` with the `question` argument set to a "
+                                "string that STARTS with `new_domain:<slug>,` "
+                                "where <slug> is a short lowercase id derived from "
+                                "the site's domain (e.g. smscrm.co.il -> smscrm). "
+                                "Example: clarify(question=\"new_domain:smscrm, "
+                                "אנא הזן/י את פרטי הגישה ל-SMSCRM\"). Make the tool "
+                                "call now — do not write any more text, do not ask "
+                                "for the email or password in chat.]"
+                            ),
+                        }
+                    )
+                    agent._session_messages = messages
+                    continue
+
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 # Pop thinking-only prefill and empty-response retry
