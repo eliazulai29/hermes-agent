@@ -291,45 +291,93 @@ def _same_interpreter(a: str, b: str) -> bool:
     return False
 
 
-def _check_interpreter_deps(interpreter: str, script: str, cmd: str) -> Optional[CommandIssue]:
-    """Probe: does the script import cleanly under the stated interpreter?
+def _script_top_imports(script_resolved: str) -> List[str]:
+    """Statically extract the top-level import module names from a Python script
+    (no execution — safe). Returns the root module of each import."""
+    mods: List[str] = []
+    try:
+        import ast as _ast
+        tree = _ast.parse(
+            open(script_resolved, "r", encoding="utf-8", errors="ignore").read()
+        )
+    except Exception:
+        return mods
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                mods.append(a.name.split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module and node.level == 0:
+                mods.append(node.module.split(".")[0])
+    # Dedup, drop stdlib-obvious + local names handled by the importability probe.
+    seen = set()
+    out = []
+    for m in mods:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
-    Runs `<interpreter> <script> --help` (no side effects — argparse prints help
-    and exits) and looks for an import failure. Generic: no package/script names
-    hardcoded. Only a WARNING (system python MIGHT have the deps), and suggests
-    the engine interpreter that a scheduled run will actually use.
+
+def _imports_ok_under(interp: str, mods: List[str]) -> Optional[str]:
+    """Return the first module that fails to import under `interp`, or None if
+    all import cleanly. Side-effect-free: only `import` is attempted."""
+    if not mods:
+        return None
+    expr = (
+        "import importlib,sys\n"
+        f"mods={mods!r}\n"
+        "for m in mods:\n"
+        "  try: importlib.import_module(m)\n"
+        "  except ImportError: print(m); sys.exit(0)\n"
+    )
+    try:
+        proc = subprocess.run(
+            [interp, "-c", expr], capture_output=True, text=True, timeout=15
+        )
+        missing = (proc.stdout or "").strip().splitlines()
+        return missing[0] if missing else None
+    except Exception:
+        return None  # can't probe → don't false-block
+
+
+def _check_interpreter_deps(interpreter: str, script: str, cmd: str) -> Optional[CommandIssue]:
+    """Probe (SIDE-EFFECT-FREE): do the script's imports resolve under the stated
+    interpreter? We statically read its top-level imports and try to import each
+    under the interpreter — never running the script itself. If an import is
+    missing under the interpreter the flow will use, but PRESENT under the engine
+    interpreter, the flow WILL fail at runtime → block it (fatal). No script
+    names or packages hardcoded — works for any script with any dependency.
     """
     interp = _expand(interpreter)
     script_resolved = _expand(script)
-    try:
-        proc = subprocess.run(
-            [interp, script_resolved, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        # The interpreter itself doesn't exist → that's a real (fatal) problem.
+    if not os.path.exists(interp) and "/" in interp:
         return CommandIssue(
             command=cmd,
             reason=f"interpreter not found: {interpreter}",
             suggestion=f"use the engine interpreter: {_engine_python()}",
             fatal=True,
         )
-    except Exception:
-        return None  # can't probe → don't false-block
-
-    err = (proc.stderr or "") + (proc.stdout or "")
-    if re.search(r"(ModuleNotFoundError|ImportError|No module named)", err):
-        m = re.search(r"No module named ['\"]([\w.]+)['\"]", err)
-        missing = f" (missing: {m.group(1)})" if m else ""
-        return CommandIssue(
-            command=cmd,
-            reason=f"'{interpreter}' is missing a dependency this script needs{missing}",
-            suggestion=f"use the engine interpreter, which has it: {_engine_python()}",
-            fatal=False,  # warning — but a scheduled run WILL use the engine interp
-        )
-    return None
+    mods = _script_top_imports(script_resolved)
+    missing = _imports_ok_under(interp, mods)
+    if not missing:
+        return None
+    # Confirm the engine interpreter HAS it (so the fix is right + it's not a
+    # missing-everywhere dep, which would be the user's env, not a flow bug).
+    eng = _engine_python()
+    engine_has_it = (
+        not _same_interpreter(interpreter, eng)
+        and _imports_ok_under(eng, [missing]) is None
+    )
+    return CommandIssue(
+        command=cmd,
+        reason=(
+            f"'{interpreter}' can't import '{missing}' that this script needs "
+            f"— this WILL fail at runtime"
+        ),
+        suggestion=f"use the engine interpreter, which has it: {eng}",
+        fatal=engine_has_it,  # verified failure + verified fix → block
+    )
 
 
 def _suggest_path(missing: str) -> str:
@@ -443,18 +491,96 @@ def _closest(target: str, options: List[str]) -> Optional[str]:
     return best if best_score >= 2 else None
 
 
+def _referenced_scripts(content: str) -> List[str]:
+    """Collect script files the flow references (so we can validate THEIR
+    internals too — the bug class where a flow's own script calls a tool with the
+    wrong interpreter, which a SKILL.md-only scan misses). We look at every
+    command line and pull the script-path token that exists on disk."""
+    scripts: List[str] = []
+    seen = set()
+    for cmd in _extract_command_lines(content):
+        toks = _safe_split(cmd)
+        if not toks:
+            continue
+        s = _script_token(toks)
+        if not s:
+            continue
+        resolved = _expand(s)
+        if resolved in seen:
+            continue
+        if resolved.endswith((".py", ".sh", ".js", ".mjs")) and os.path.exists(
+            resolved
+        ):
+            seen.add(resolved)
+            scripts.append(resolved)
+    return scripts
+
+
+def _extract_commands_from_script(path: str) -> List[str]:
+    """Extract candidate sub-commands a script runs (subprocess/os.system/exec).
+
+    Generic source scan — no script-name hardcoding. We find:
+      - subprocess.run/Popen/call/check_* with a LIST of string args → reconstruct
+        the command (this catches `["python3", GOOGLE_API, "gmail", "send", ...]`).
+      - os.system("...") / shell strings with a known launcher.
+    String-variable args (e.g. str(GOOGLE_API)) are kept as-is so the launcher +
+    flags are still checkable even when the path is a variable.
+    """
+    cmds: List[str] = []
+    try:
+        src = open(path, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return cmds
+
+    # subprocess.* with a list literal of args → join the string elements.
+    # Matches: subprocess.run([ "python3", str(X), "gmail", "send", ... ])
+    for m in re.finditer(
+        r"subprocess\.(?:run|Popen|call|check_call|check_output)\s*\(\s*\[([^\]]*)\]",
+        src,
+        re.DOTALL,
+    ):
+        parts: List[str] = []
+        for tok in re.findall(r"""(["'])(.*?)\1""", m.group(1)):
+            parts.append(tok[1])
+        if parts:
+            cmds.append(" ".join(parts))
+
+    # os.system("....") shell strings.
+    for m in re.finditer(r"""os\.system\s*\(\s*["'](.+?)["']\s*\)""", src):
+        cmds.append(m.group(1))
+
+    return cmds
+
+
 def validate_flow_content(content: str) -> ValidationResult:
     """
-    Validate every concrete command in a flow SKILL.md. Returns a
-    ValidationResult; `ok` is False only when there is at least one FATAL issue
-    (a provably-wrong path or flag). Warnings never block the save.
+    Validate every concrete command in a flow SKILL.md AND in the scripts the
+    flow references (one level deep). Returns a ValidationResult; `ok` is False
+    only when there is at least one FATAL issue (a provably-wrong path or flag).
+    Warnings never block the save.
     """
     if not is_flow_skill(content):
         return ValidationResult(ok=True)
 
     issues: List[CommandIssue] = []
+
+    # 1) Commands written directly in the SKILL.md (paths, flags, interpreter
+    #    import-resolution for direct script invocations).
     for cmd in _extract_command_lines(content):
         issues.extend(_validate_one(cmd))
+
+    # 2) Best-effort: scan INLINE subprocess list-literals inside referenced
+    #    scripts (one level). NOTE: this is intentionally shallow — arbitrarily
+    #    nested / variable-built subprocess commands cannot be resolved statically
+    #    and reliably. The authoritative catch for those is the TEST-RUN GATE
+    #    (flow-builder שלב 7): a flow must actually RUN once and succeed before a
+    #    cron is created. Static lint catches the common cases; the smoke test
+    #    catches the deep ones. This split is the production-correct design.
+    for script_path in _referenced_scripts(content):
+        for inner in _extract_commands_from_script(script_path):
+            for issue in _validate_one(inner):
+                issue.reason = f"in {os.path.basename(script_path)}: {issue.reason}"
+                issues.append(issue)
 
     has_fatal = any(i.fatal for i in issues)
     return ValidationResult(ok=not has_fatal, issues=issues)

@@ -320,6 +320,28 @@ class MemoryStore:
             self._rebuild_bank(row["category"])
             return True
 
+    def remove_fact_by_content(self, content: str) -> bool:
+        """Delete a fact matching `content` exactly (or as a substring of a
+        stored fact). Returns True if a row was removed. Used to keep holographic
+        consistent when the built-in memory tool removes/replaces an entry."""
+        if not content:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id FROM facts WHERE content = ?", (content,)
+            ).fetchone()
+            if row is None:
+                # Fall back to substring match (built-in memory remove uses a
+                # substring of the entry as `old_text`).
+                row = self._conn.execute(
+                    "SELECT fact_id FROM facts WHERE content LIKE ? LIMIT 1",
+                    (f"%{content}%",),
+                ).fetchone()
+            if row is None:
+                return False
+            fid = row["fact_id"]
+        return self.remove_fact(fid)
+
     def list_facts(
         self,
         category: str | None = None,

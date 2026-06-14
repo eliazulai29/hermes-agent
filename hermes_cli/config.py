@@ -1283,8 +1283,13 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Always-in-prompt memory budgets. Sized for modern large-context models
+        # (200K+): an always-injected block of a few K tokens is a tiny fraction
+        # of context and is prompt-cache-stable. Anything beyond these caps
+        # auto-overflows into the searchable long-term (holographic) store, so
+        # these are the "working set" size, not a hard ceiling on what's known.
+        "memory_char_limit": 24000,  # ~8000 tokens — active operational context
+        "user_char_limit": 12000,    # ~4000 tokens — rich user identity/profile
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

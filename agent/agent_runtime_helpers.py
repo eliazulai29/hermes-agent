@@ -1600,13 +1600,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             old_text=function_args.get("old_text"),
             store=agent._memory_store,
         )
-        # Bridge: notify external memory provider of built-in memory writes
-        if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
+        # Bridge: notify external memory provider of built-in memory writes so
+        # long-term (holographic) memory stays in sync. We propagate add, replace
+        # AND remove (previously only add/replace) so edits/deletes don't leave
+        # stale duplicates in the searchable store.
+        if agent._memory_manager and function_args.get("action") in {"add", "replace", "remove"}:
             try:
                 agent._memory_manager.on_memory_write(
                     function_args.get("action", ""),
                     target,
-                    function_args.get("content", ""),
+                    function_args.get("content", "") or function_args.get("old_text", ""),
                     metadata=agent._build_memory_write_metadata(
                         task_id=effective_task_id,
                         tool_call_id=tool_call_id,
@@ -1614,6 +1617,25 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 )
             except Exception:
                 pass
+        # AUTO-OVERFLOW: when the small always-in-prompt layer was full, memory_tool
+        # evicted the least-essential entries and returned them in `overflowed`.
+        # Mirror each into long-term (holographic) memory so they stay searchable
+        # and auto-surface when relevant — nothing is lost, the small layer stays
+        # curated, and the agent never hits a "memory full" error.
+        if agent._memory_manager and isinstance(result, dict):
+            for evicted in result.get("overflowed", []) or []:
+                try:
+                    agent._memory_manager.on_memory_write(
+                        "add",
+                        target,
+                        evicted,
+                        metadata=agent._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=tool_call_id,
+                        ),
+                    )
+                except Exception:
+                    pass
         return result
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         return agent._memory_manager.handle_tool_call(function_name, function_args)

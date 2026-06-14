@@ -59,6 +59,16 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 
+# Pin marker: an always-in-prompt entry that must NEVER be auto-evicted on
+# overflow (identity / durable preferences). An entry is pinned if it starts
+# with this marker. The marker stays in the rendered text (it's a tiny glyph)
+# so the agent can see which facts are foundational.
+_PIN_MARKER = "📌"
+
+
+def _is_pinned(entry: str) -> bool:
+    return entry.lstrip().startswith(_PIN_MARKER)
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -122,7 +132,7 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 24000, user_char_limit: int = 12000):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -342,28 +352,58 @@ class MemoryStore:
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
-            # Calculate what the new total would be
-            new_entries = entries + [content]
-            new_total = len(ENTRY_DELIMITER.join(new_entries))
-
-            if new_total > limit:
-                current = self._char_count(target)
+            # If the single new entry alone exceeds the whole limit, it can't be an
+            # always-in-prompt fact — tell the agent to store it in long-term
+            # (holographic) memory instead of forcing it into the small layer.
+            if len(content) > limit:
                 return {
                     "success": False,
                     "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
+                        f"This entry ({len(content)} chars) is larger than the entire "
+                        f"{target} memory budget ({limit:,}). It is too detailed to keep "
+                        f"always-in-prompt — store it in long-term memory with "
+                        f"fact_store(action='add') instead."
                     ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
                 }
+
+            # AUTO-OVERFLOW (never error, never lose): if adding would exceed the
+            # cap, evict the least-essential EXISTING entries to long-term memory
+            # until the new one fits. Evicted entries are returned in `overflowed`
+            # so the call site mirrors them into the holographic store (still
+            # searchable + auto-surfaced when relevant — nothing is lost). The
+            # always-in-prompt layer thus stays a curated "most-relevant few".
+            overflowed: List[str] = []
+            new_total = len(ENTRY_DELIMITER.join(entries + [content]))
+            if new_total > limit:
+                # Pinned entries (identity / durable prefs, marked with a leading
+                # 📌) are NEVER evicted from USER memory — they must stay present.
+                evict_order = [
+                    e for e in entries if not _is_pinned(e)
+                ]  # oldest non-pinned first (list order = insertion order)
+                idx = 0
+                while (
+                    len(ENTRY_DELIMITER.join(entries + [content])) > limit
+                    and idx < len(evict_order)
+                ):
+                    victim = evict_order[idx]
+                    idx += 1
+                    if victim in entries:
+                        entries.remove(victim)
+                        overflowed.append(victim)
+                # If still over after evicting all non-pinned (everything pinned),
+                # accept slightly over rather than drop a pin or the new fact —
+                # the snapshot render is best-effort and pins are sacred.
 
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        resp = self._success_response(target, "Entry added.")
+        if overflowed:
+            # Signal the call site to mirror these into long-term (holographic)
+            # memory so they stay searchable. (See agent_runtime_helpers bridge.)
+            resp["overflowed"] = overflowed
+        return resp
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -694,9 +734,21 @@ MEMORY_SCHEMA = {
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "TWO ALWAYS-IN-PROMPT TARGETS (keep these SMALL + curated — they're in every prompt):\n"
+        "- 'user': WHO the user is -- name, role, standing preferences, communication style.\n"
+        "  Prefix a foundational/identity fact with 📌 to PIN it (never auto-evicted).\n"
+        "- 'memory': HOW WE WORK NOW -- currently-active context: which flows exist + where,\n"
+        "  current environment facts, conventions in active use.\n\n"
+        "TIER ROUTING (important — keeps memory smart over a long life):\n"
+        "- DEEP / SPECIFIC operational detail (a system's full quirk list, exact command\n"
+        "  syntaxes, a flow's step-by-step lessons, per-customer notes) → DO NOT put in the\n"
+        "  always-in-prompt layers. Store it in long-term searchable memory with\n"
+        "  fact_store(action='add') instead. It auto-surfaces when relevant + you can search it.\n"
+        "- The always-in-prompt 'user'/'memory' layers are for the few facts needed on EVERY\n"
+        "  turn (identity, active-work pointers) — not a knowledge dump.\n"
+        "- If a layer is full, an add now AUTO-OVERFLOWS the oldest non-pinned entry into\n"
+        "  long-term memory (never errors, never lost) — but prefer routing deep detail to\n"
+        "  fact_store from the start so the small layers stay lean.\n\n"
         "ACTIONS: read (return current entries -- call this BEFORE discussing a "
         "customer so you ground on what you already know), add (new entry), "
         "replace (update existing -- old_text identifies it), "

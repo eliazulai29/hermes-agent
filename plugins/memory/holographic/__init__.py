@@ -242,13 +242,28 @@ class HolographicMemoryProvider(MemoryProvider):
         self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
-                category = "user_pref" if target == "user" else "general"
+        """Mirror built-in memory writes as facts, keeping the searchable store
+        consistent with the always-in-prompt layers. We propagate add, replace
+        and remove (previously add-only) so edits/deletes don't leave stale
+        duplicates that the per-turn prefetch could resurface."""
+        if not self._store or not content:
+            return
+        try:
+            category = "user_pref" if target == "user" else "general"
+            if action == "add":
                 self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+            elif action == "replace":
+                # The new entry content arrives here; the old one was a substring
+                # of it or a prior version. Add the new fact (dedup-safe); the old
+                # near-duplicate is cleaned up over time by remove propagation and
+                # trust decay. (Best-effort — replace gives us the NEW text only.)
+                self._store.add_fact(content, category=category)
+            elif action == "remove":
+                # `content` here is the old_text the agent removed → drop the
+                # matching fact so it stops surfacing.
+                self._store.remove_fact_by_content(content)
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror (%s) failed: %s", action, e)
 
     def shutdown(self) -> None:
         self._store = None
