@@ -268,6 +268,63 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     return None
 
 
+def _validate_flow_commands(content: str) -> Optional[str]:
+    """Verify-before-save gate for teach-mode FLOW skills.
+
+    For a flow skill (one with a `metadata.flow` manifest), every concrete shell
+    command in the body must reference real script paths and CLI flags that the
+    target scripts actually accept. Returns an error string (blocking the save)
+    when a command is provably wrong, or None when the flow is clean / not a flow.
+    Best-effort: any failure in the validator itself never blocks a save.
+    """
+    try:
+        from tools.flow_validator import validate_flow_content, format_issues_for_agent
+    except Exception:
+        return None  # validator unavailable → don't block saves
+    try:
+        result = validate_flow_content(content)
+    except Exception:
+        return None  # validator error → never block on our own bug
+    if result.ok:
+        return None
+    return format_issues_for_agent(result)
+
+
+def _looks_like_flow_content(content: str) -> bool:
+    """True if the SKILL.md frontmatter declares a flow manifest."""
+    try:
+        from tools.flow_validator import is_flow_skill
+        return bool(is_flow_skill(content))
+    except Exception:
+        return False
+
+
+def _validate_flow_placement(name: str, content: str, category: str = None) -> Optional[str]:
+    """Ensure a flow skill lives under the canonical `flows/` category.
+
+    A flow is identified by its `metadata.flow` marker (the single source of
+    truth the Workflows library uses to find flows). If a skill declares that
+    marker but is being saved outside `flows/`, the library would still find it
+    by marker — but to keep ALL flows in one coherent place (so the user can see
+    and manage them), we require flow skills to be saved with `category="flows"`
+    (or a name already prefixed `flows/`). Returns an error string to block, or
+    None when fine / not a flow.
+    """
+    if not _looks_like_flow_content(content):
+        return None
+    # Already under flows/ (either via category or a flows/<slug> name)?
+    if (category or "").strip().lower() == "flows":
+        return None
+    if name.replace("\\", "/").lower().startswith("flows/"):
+        return None
+    return (
+        "This is a FLOW (its frontmatter has a `metadata.flow` block), so it must "
+        "be saved under the flows library. Re-run skill_manage with "
+        "`category=\"flows\"` (or name it `flows/<slug>`) so the user can find and "
+        "manage it in תהליכים. All flows live under skills/flows/<slug>/."
+    )
+
+
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
     if category:
@@ -493,6 +550,21 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
+    # VERIFY-BEFORE-SAVE GATE: if this is a teach-mode FLOW skill, every concrete
+    # command in it must reference real script paths and real CLI flags. This
+    # blocks the failure mode where the agent writes a command from memory
+    # (wrong path / wrong flag) that would fail on the first unattended run —
+    # a user can't catch that, so we catch it here. Warnings never block.
+    err = _validate_flow_commands(content)
+    if err:
+        return {"success": False, "error": err}
+
+    # FLOW PLACEMENT: a flow must be saved under the flows/ library so the user
+    # can see and manage all flows in one place (and so it never goes invisible).
+    err = _validate_flow_placement(name, content, category)
+    if err:
+        return {"success": False, "error": err}
+
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
@@ -537,6 +609,14 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         return {"success": False, "error": err}
 
     err = _validate_content_size(content)
+    if err:
+        return {"success": False, "error": err}
+
+    # VERIFY-BEFORE-SAVE GATE (edit path): an edit must not be able to introduce
+    # a broken/guessed command into a flow any more than a create can. Validate
+    # the RESULTING content before writing. (Previously the gate only protected
+    # create — edits silently bypassed it.)
+    err = _validate_flow_commands(content)
     if err:
         return {"success": False, "error": err}
 
@@ -641,6 +721,14 @@ def _patch_skill(
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
+
+        # VERIFY-BEFORE-SAVE GATE (patch path): the patched RESULT must not
+        # contain a broken/guessed command in a flow. Validate before writing so
+        # a bad patch is rejected, not persisted. (Previously the gate only
+        # protected create — patches silently bypassed it.)
+        err = _validate_flow_commands(new_content)
+        if err:
+            return {"success": False, "error": err}
 
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)

@@ -679,6 +679,26 @@ class CDPSupervisor:
 
     async def _attach_initial_page(self) -> None:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
+        # ── Direct page-level CDP endpoint ───────────────────────────────────
+        # GENERIC behaviour (not Electron-specific): when the cdp_url is a
+        # PAGE-level websocket (.../devtools/page/<id>) rather than a browser
+        # endpoint, the socket already IS that page's session. Driving it
+        # directly with session_id=None is the correct CDP usage — there is no
+        # browser-level target to enumerate or attach to. (This also avoids a
+        # failing browser-level Target.attachToTarget when the page is a kind the
+        # backend won't flatten-attach, e.g. an Electron <webview>.) Verified:
+        # Page.enable / Page.navigate / Runtime.evaluate work and survive
+        # navigation on this socket.
+        if "/devtools/page/" in (self.cdp_url or ""):
+            self._page_session_id = None  # default session on the page socket
+            await self._cdp("Page.enable")
+            await self._cdp("Runtime.enable")
+            try:
+                await self._install_dialog_bridge(None)
+            except Exception:
+                pass
+            return
+
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
         page_target = next((t for t in targets if t.get("type") == "page"), None)
