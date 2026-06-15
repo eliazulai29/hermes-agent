@@ -748,6 +748,37 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_schedule(args: dict, **kw) -> str:
+    """Park a task in 'scheduled' — waiting on time/event, not human input."""
+    guard = _require_orchestrator_tool("kanban_schedule")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    ownership_err = _enforce_worker_task_ownership(str(tid))
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    reason = args.get("reason")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.schedule_task(conn, str(tid), reason=reason)
+            if not ok:
+                return tool_error(
+                    f"could not schedule {tid} (unknown task or invalid state)"
+                )
+            return _ok(task_id=str(tid), status="scheduled")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_schedule: {e}")
+    except Exception as e:
+        logger.exception("kanban_schedule failed")
+        return tool_error(f"kanban_schedule: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
@@ -1205,6 +1236,34 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SCHEDULE_SCHEMA = {
+    "name": "kanban_schedule",
+    "description": (
+        "Park a Kanban task in 'scheduled' — waiting on TIME or an external EVENT, "
+        "NOT on human input (use kanban_block for human-input waits). A scheduled "
+        "task is not dispatched until something later calls kanban_unblock to "
+        "re-gate it (an external cron watcher, an arriving email, automation). "
+        "This is the primitive for long-running waits in a saga: e.g. 'wait for "
+        "insurer X's reply email' — park the card as scheduled, and a watcher "
+        "unblocks it when the event fires. Orchestrator-only (kanban toolset)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to park as scheduled (waiting on time/event).",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why it's waiting (e.g. 'awaiting Migdal reply email').",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1298,6 +1357,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_schedule",
+    toolset="kanban",
+    schema=KANBAN_SCHEDULE_SCHEMA,
+    handler=_handle_schedule,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="⏳",
 )
 
 registry.register(
